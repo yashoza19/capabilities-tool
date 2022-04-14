@@ -15,24 +15,35 @@
 package capabilities
 
 import (
-	"fmt"
-	"github.com/gobuffalo/envy"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"strings"
-
+	"archive/tar"
 	"capabilities-tool/pkg"
 	"capabilities-tool/pkg/models"
 	index "capabilities-tool/pkg/reports/capabilities"
-
+	"fmt"
+	"github.com/gobuffalo/envy"
+	"github.com/google/go-containerregistry/pkg/crane"
 	_ "github.com/mattn/go-sqlite3"
+	operatorv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
+	"io"
+	"os"
+	"os/exec"
+	"path"
+	"path/filepath"
+	"strings"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v2"
 )
 
 var flags = index.BindFlags{}
+
+var prioritizedInstallModes = []string{
+	string(operatorv1alpha1.InstallModeTypeOwnNamespace),
+	string(operatorv1alpha1.InstallModeTypeSingleNamespace),
+	string(operatorv1alpha1.InstallModeTypeMultiNamespace),
+	string(operatorv1alpha1.InstallModeTypeAllNamespaces),
+}
 
 func NewCmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -50,6 +61,8 @@ func NewCmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&flags.PackageName, "package-name", "",
+		"filter by the Package names which are like *package-name*. Required for Operator Clean-up")
+	cmd.Flags().BoolVar(&flags.InstallMode, "install-mode", false,
 		"filter by the Package names which are like *package-name*. Required for Operator Clean-up")
 	cmd.Flags().StringVar(&flags.BundleName, "bundle-name", "",
 		"filter by the Bundle names which are like *bundle-name*")
@@ -108,9 +121,14 @@ func run(cmd *cobra.Command, args []string) error {
 	pkg.GenerateTemporaryDirs()
 
 	var Bundle models.AuditCapabilities
+	targetNamespaces := []string{"default"}
+
+	if flags.InstallMode {
+		targetNamespaces, _ = RunInstallMode(flags.FilterBundle)
+	}
 
 	log.Info("Deploying operator with operator-sdk...")
-	operatorsdk := exec.Command("operator-sdk", "run", "bundle", flags.FilterBundle, "--pull-secret-name", flags.PullSecretName, "--timeout", "5m")
+	operatorsdk := exec.Command("operator-sdk", "run", "bundle", flags.FilterBundle, "--pull-secret-name", flags.PullSecretName, "--timeout", "5m", "--namespace", targetNamespaces[0])
 	runCommand, err := pkg.RunCommand(operatorsdk)
 
 	if err != nil {
@@ -147,14 +165,211 @@ func run(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	log.Info("Uploading result to S3")
-	filename := pkg.GetReportName(reportData.Flags.BundleName, "cap_level_1", "json")
-	path := filepath.Join(reportData.Flags.OutputPath, filename)
-	if err := pkg.WriteDataToS3(path, filename, flags.S3Bucket, flags.Endpoint); err != nil {
-		return err
+	if flags.S3Bucket != "" {
+		log.Info("Uploading result to S3")
+		filename := pkg.GetReportName(reportData.Flags.BundleName, "cap_level_1", "json")
+		path := filepath.Join(reportData.Flags.OutputPath, filename)
+		if err := pkg.WriteDataToS3(path, filename, flags.S3Bucket, flags.Endpoint); err != nil {
+			return err
+		}
 	}
 
 	log.Info("Task Completed!!!!!")
 
 	return nil
+}
+
+func untar(dst string, r io.Reader) error {
+	tr := tar.NewReader(r)
+
+	for {
+		header, err := tr.Next()
+
+		switch {
+
+		// if no more files are found return
+		case err == io.EOF:
+			return nil
+
+		// return any other error
+		case err != nil:
+			return err
+
+		// if the header is nil, just skip it (not sure how this happens)
+		case header == nil:
+			continue
+		}
+
+		// the target location where the dir/file should be created
+		target := filepath.Join(dst, header.Name)
+
+		// the following switch could also be done using fi.Mode(), not sure if there
+		// a benefit of using one vs. the other.
+		// fi := header.FileInfo()
+
+		// check the file type
+		switch header.Typeflag {
+
+		// if its a dir and it doesn't exist create it
+		case tar.TypeDir:
+			if _, err := os.Stat(target); err != nil {
+				if err := os.MkdirAll(target, 0o755); err != nil {
+					return err
+				}
+			}
+
+		// if it's a file create it
+		case tar.TypeReg:
+			f, err := os.OpenFile(target, os.O_CREATE|os.O_RDWR, os.FileMode(header.Mode))
+			if err != nil {
+				return err
+			}
+
+			// copy over contents
+			if _, err := io.Copy(f, tr); err != nil {
+				return err
+			}
+
+			// manually close here after each file operation; defering would cause each file close
+			// to wait until all operations have completed.
+			f.Close()
+
+			// if it's a link create it
+		case tar.TypeSymlink:
+			err := os.Symlink(header.Linkname, filepath.Join(dst, header.Name))
+			if err != nil {
+				log.Println(fmt.Sprintf("Error creating link: %s. Ignoring.", header.Name))
+				continue
+			}
+		}
+	}
+}
+
+func getCsvFilePathFromBundle(mountedDir string) (string, error) {
+	log.Trace("reading clusterserviceversion file from the bundle")
+	log.Debug("mounted directory is ", mountedDir)
+	matches, err := filepath.Glob(filepath.Join(mountedDir, "manifests", "*.clusterserviceversion.yaml"))
+	if err != nil {
+		log.Error("glob pattern is malformed: ", err)
+		return "", err
+	}
+	if len(matches) == 0 {
+		log.Error("unable to find clusterserviceversion file in the bundle image: ", err)
+		return "", err
+	}
+	if len(matches) > 1 {
+		log.Error("found more than one clusterserviceversion file in the bundle image: ", err)
+		return "", err
+	}
+	log.Debugf("The path to csv file is %s", matches[0])
+	return matches[0], nil
+}
+
+func RunInstallMode(PackageName string) ([]string, error) {
+	log.Info("Pulling image: ", flags.FilterBundle)
+
+	options := make([]crane.Option, 0)
+	img, err := crane.Pull(flags.FilterBundle, options...)
+	if err != nil {
+		return nil, fmt.Errorf("Unable to pull image: %v\n", err)
+	}
+
+	containerFSPath := path.Join("tmp", "bundle")
+	if err := os.Mkdir(containerFSPath, 0o755); err != nil {
+		return nil, fmt.Errorf("%s: %s", containerFSPath, err)
+	}
+
+	// export/flatten, and extract
+	log.Debug("exporting and flattening image")
+	r, w := io.Pipe()
+	go func() {
+		defer w.Close()
+		log.Debugf("writing container filesystem to output dir: %s", containerFSPath)
+		err = crane.Export(img, w)
+		if err != nil {
+			log.Error("unable to export and flatten container filesystem:", err)
+		}
+	}()
+
+	log.Debug("extracting container filesystem to ", containerFSPath)
+	if err := untar(containerFSPath, r); err != nil {
+		return nil, fmt.Errorf("%s", err)
+	}
+
+	installedModes, err := GetSupportedInstalledModes("tmp/bundle")
+	log.Info(installedModes)
+
+	var installMode string
+	for i := 0; i < len(prioritizedInstallModes); i++ {
+		if _, ok := installedModes[prioritizedInstallModes[i]]; ok {
+			installMode = prioritizedInstallModes[i]
+			break
+		}
+	}
+	log.Info(installMode)
+	log.Debugf("The operator install mode is %s", installMode)
+	targetNamespaces := make([]string, 2)
+
+	switch installMode {
+	case string(operatorv1alpha1.InstallModeTypeOwnNamespace):
+		targetNamespaces = []string{flags.PackageName}
+	case string(operatorv1alpha1.InstallModeTypeSingleNamespace):
+		targetNamespaces = []string{flags.PackageName + "-target"}
+	case string(operatorv1alpha1.InstallModeTypeMultiNamespace):
+		targetNamespaces = []string{flags.PackageName, flags.PackageName + "-target"}
+	case string(operatorv1alpha1.InstallModeTypeAllNamespaces):
+		targetNamespaces = []string{}
+
+	}
+	log.Info("Creating namespace: ", targetNamespaces)
+	createNamespace := exec.Command("oc", "new-project", targetNamespaces[0])
+	_, err = pkg.RunCommand(createNamespace)
+
+	if err != nil {
+		log.Errorf("Unable to create namespace: ", err)
+	}
+
+	return targetNamespaces, nil
+}
+
+func GetSupportedInstalledModes(mountedDir string) (map[string]bool, error) {
+	csvFilepath, err := getCsvFilePathFromBundle(mountedDir)
+	if err != nil {
+		return nil, err
+	}
+
+	csvFileReader, err := os.ReadFile(csvFilepath)
+	if err != nil {
+		log.Error(err)
+		return nil, err
+	}
+
+	var csv ClusterServiceVersion
+	err = yaml.Unmarshal(csvFileReader, &csv)
+	if err != nil {
+		log.Error(err)
+		return nil, err
+	}
+
+	var installedModes map[string]bool = make(map[string]bool, len(csv.Spec.InstallModes))
+	for _, v := range csv.Spec.InstallModes {
+		if v.Supported {
+			installedModes[v.Type] = true
+		}
+	}
+	return installedModes, nil
+}
+
+type ClusterServiceVersion struct {
+	Spec ClusterServiceVersionSpec `yaml:"spec"`
+}
+
+type ClusterServiceVersionSpec struct {
+	// InstallModes specify supported installation types
+	InstallModes []InstallMode `yaml:"installModes,omitempty"`
+}
+
+type InstallMode struct {
+	Type      string `yaml:"type"`
+	Supported bool   `yaml:"supported"`
 }

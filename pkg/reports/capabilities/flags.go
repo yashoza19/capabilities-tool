@@ -5,6 +5,7 @@ type BindFlags struct {
 	//IndexImage      string `json:"image"`
 	BundleName string `json:"bundleName,omitempty"`
 	//Limit           int32  `json:"limit"`
+	InstallMode bool `json:"installMode,omitempty"`
 	//HeadOnly        bool   `json:"headOnly"`
 	Endpoint string `json:"endpoint"`
 	S3Bucket string `json:"s3Bucket"`
